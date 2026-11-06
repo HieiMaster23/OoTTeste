@@ -16,11 +16,12 @@ Medido em uma RX 6600M, driver 2.0.353, sem `VK_EXT_robustness2`, em Kokiri e no
 | Item | Estado |
 |---|---|
 | Tela escura, vegetação, exposição e neblina volumétrica | Corrigidos na base anterior. **A imagem nesta base nova ainda não foi conferida** |
-| Queda do driver ao compilar shaders | Contornada: a falha do compilador é capturada e o pipeline é refeito sem subgroup |
+| Queda do driver ao compilar shaders | Contornada: a falha do compilador é capturada e o pipeline é refeito sem subgroup. Os dois fragments conhecidos agora compilam sem otimização |
+| Linha preta no horizonte em Hyrule Field | Correção candidata nesta versão, **ainda não testada** |
 | Estabilidade | Cerca de 8 min nesta base, sem perda de dispositivo |
 | Manchas do layer `c72b6ea746c00433` | Contornadas ao desligar o shader, o que também remove a névoa rente ao chão e o rio |
-| FPS | 21-24 nas melhores janelas, com o cache de shaders ainda sendo preenchido |
-| Travamentos | Frames de cerca de 83 s e 63 s na primeira sessão. Causa não provada |
+| FPS | Antes desta versão: 21-24 em Kokiri nas melhores janelas e 19-20 em Hyrule Field. **Esta versão ainda não foi medida** |
+| Travamentos | Draws nativos esperam o pipeline mesmo com shaders assíncronos: 35,7 s de espera em uma sessão, com picos de 1,5 s. Cerca de 36% dos frames acima de 100 ms não têm pipeline por perto, e a causa desses ainda não foi medida |
 | Computes `F9EA14A22394F5B1` e `8C29514395041853` | Falharam com `VK_ERROR_OUT_OF_HOST_MEMORY`. Efeito na imagem desconhecido |
 
 O FPS veio de uma única sessão. Ainda falta uma sessão de referência com o cache cheio, na mesma cena.
@@ -30,9 +31,10 @@ O FPS veio de uma única sessão. Ainda falta uma sessão de referência com o c
 Base: [zortos293/Lichii](https://github.com/zortos293/Lichii), commit `5f6066b26` (#184). O primeiro commit deste repositório é uma cópia desse tree, sem `.github/workflows`; o histórico e a autoria originais estão lá.
 
 - Sharkiix (`Shakoquo/Lichii-sharkiix-version`, commit `28f594acc`): tensor em AMD, GC de texturas e espera estreita de DMA de macro.
-- Captura de falha do compilador AMD e nova tentativa sem subgroup. Pipelines com fragment que usa subgroup são emitidos de forma síncrona.
+- Captura de falha do compilador AMD e nova tentativa sem subgroup. O fallback é traduzido na thread da GPU e emitido no worker.
 - Proteções para AMD: `EDEN_C0_AMD_BOUNDS`, buffer nulo, `EDEN_C0_AMD_DISPATCH_BARRIERS` e `EDEN_C0_PTR_*`.
-- Do Lichii: #185 (ordem de deferred clear), #176 (banco uniforme) e #192 (pipelines guardados e de mesh no disco).
+- Do Lichii: #185 (ordem de deferred clear), #176 (banco uniforme), #192 (pipelines guardados e de mesh no disco), os commits da build-88 (#193, #194 e #240) e os PRs #206 (laço atômico) e #210 (compilação sem otimização). Do #240 vem o Dynamic FPS, ligado por padrão. Quem já tem o mod `Dynamic-fps` continua usando o próprio.
+- `EDEN_C0_FRAG_EXPORT_MASK`: não escreve em alvos de cor que o fragment não exporta. Só no caminho de máscara estática; drivers com blend dinâmico (EDS3) não mudam.
 - `EDEN_C0_SUBMIT_BEFORE_FENCE_WAIT`: envia o trabalho pendente antes de esperar uma fence.
 - `EDEN_NX2_WRITTEN_SSBO_MARK_KIB`, desligado por padrão, e `EDEN_NX2_PRESENT_STATS_EVERY` funcionando.
 
@@ -59,18 +61,22 @@ O script recusa empacotar com alterações sem commit, para o zip corresponder s
 
 ## Próximos testes
 
-Nenhum destes precisa recompilar. Mudar uma variável por vez, na mesma cena, com `EDEN_NX2_PRESENT_STATS_EVERY=60`.
+Nenhum destes precisa recompilar. Mudar uma variável por vez, na mesma cena, com `EDEN_NX2_PRESENT_STATS_EVERY=60`. A cena de referência agora é Hyrule Field.
+
+O #194 voltou os padrões de envio à GPU para 128 draws e 500 µs. Para comparar com os valores anteriores, use `EDEN_NX2_FENCE_FLUSH_US=5000`.
 
 | Ordem | Variável | O que responde |
 |---|---|---|
 | 1 | Nenhuma, com o cache cheio | Referência de FPS e imagem desta base |
-| 2 | `EDEN_C0_AMD_DISPATCH_BARRIERS=0` | Quanto custam as barreiras |
-| 3 | `EDEN_NX2_IDLE_SPIN_US=30`, depois `100` | Ganho com menos espera de thread |
-| 4 | Afinidade das threads em núcleos físicos | Ganho com menos disputa entre núcleos |
-| 5 | `cpu_accuracy=Unsafe` | Ganho de CPU. Conferir a imagem |
-| 6 | `EDEN_NX2_DMA_READ_DRAIN=1` com `EDEN_NX2_REJECT_HASH=0` | Se as manchas somem e quanto custa |
-| 7 | `EDEN_NX2_WRITTEN_SSBO_MARK_KIB` | Ganho em buffers. Cuidado com culling lido pela CPU |
-| 8 | `EDEN_NX2_WAIT_PROFILE=1`, `EDEN_NX2_GPU_PROFILE=1` | Só contadores, para achar o próximo gargalo |
+| 2 | `EDEN_C0_FRAG_EXPORT_MASK=0` | Confirma se a máscara é o que remove a linha |
+| 3 | `EDEN_NX2_REJECT_HASH=0` | Se a máscara também resolveu as manchas do `c72b` e trouxe de volta a névoa rente ao chão e o rio |
+| 4 | Desligar o add-on `Max Resolution` | Quanto do frame depende de resolução. Conferir a nitidez |
+| 5 | `EDEN_NX2_NOOPT_SHADERS=all` | Quanto a compilação encurta sem otimização, e quanto o FPS cai. Só para medir |
+| 6 | `EDEN_C0_PIPELINE_WORKERS=6` | Menos disputa com as threads do jogo, contra fila maior de compilação |
+| 7 | `EDEN_C0_AMD_PIPELINE_CACHE=1` | Se um `VkPipelineCache` explícito encurta os builds do driver AMD |
+| 8 | `EDEN_C0_PIPELINE_EVICT_FRAMES=0` | Se descartar pipelines parados causa recompilação |
+| 9 | `EDEN_C0_AMD_DISPATCH_BARRIERS=0` | Quanto custam as barreiras. Conferir vegetação e névoa |
+| 10 | `EDEN_NX2_WAIT_PROFILE=1`, `EDEN_NX2_GPU_PROFILE=1` | Só contadores, para achar o próximo gargalo, inclusive as leituras da CPU em memória da GPU |
 
 Com o conjunto decidido, a última etapa é uma build com ThinLTO e PGO.
 
