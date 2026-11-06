@@ -21,6 +21,8 @@ Medido em uma RX 6600M, driver 2.0.353, sem `VK_EXT_robustness2`, em Kokiri e no
 | Estabilidade | Cerca de 8 min nesta base, sem perda de dispositivo |
 | Manchas do layer `c72b6ea746c00433` | Contornadas ao desligar o shader, o que também remove a névoa rente ao chão e o rio |
 | FPS | Antes desta versão: 21-24 em Kokiri nas melhores janelas e 19-20 em Hyrule Field. **Esta versão ainda não foi medida** |
+| Grama e texturas somem no fim do golpe de espada | Já existia antes da build-88. Causa não provada; a primeira candidata é a leitura de resultados de oclusão antigos (`EDEN_C0_QUERY_DMA_FLUSH=1`) |
+| Limite do FPS | Comunicação CPU/GPU: com 1/9 dos pixels (864x480, sem `Max Resolution`) o frame fica igual, em ~46 ms. Queda de resolução não é o caminho |
 | Travamentos | Draws nativos esperam o pipeline mesmo com shaders assíncronos: 35,7 s de espera em uma sessão, com picos de 1,5 s. Cerca de 36% dos frames acima de 100 ms não têm pipeline por perto, e a causa desses ainda não foi medida |
 | Computes `F9EA14A22394F5B1` e `8C29514395041853` | Falharam com `VK_ERROR_OUT_OF_HOST_MEMORY`. Efeito na imagem desconhecido |
 
@@ -76,7 +78,10 @@ O #194 voltou os padrões de envio à GPU para 128 draws e 500 µs. Para compara
 | 7 | `EDEN_C0_AMD_PIPELINE_CACHE=1` | Se um `VkPipelineCache` explícito encurta os builds do driver AMD |
 | 8 | `EDEN_C0_PIPELINE_EVICT_FRAMES=0` | Se descartar pipelines parados causa recompilação |
 | 9 | `EDEN_C0_AMD_DISPATCH_BARRIERS=0` | Quanto custam as barreiras. Conferir vegetação e névoa |
-| 10 | `EDEN_NX2_WAIT_PROFILE=1`, `EDEN_NX2_GPU_PROFILE=1` | Só contadores, para achar o próximo gargalo, inclusive as leituras da CPU em memória da GPU |
+| 10 | `EDEN_NX2_WAIT_PROFILE=1`, `EDEN_NX2_GPU_PROFILE=1`, `EDEN_DKB_FRAME_TRACE=1`, `EDEN_C0_CPU_READ_PROFILE=1` | Só contadores, para achar o próximo gargalo, inclusive as leituras da CPU em memória da GPU |
+| 11 | `EDEN_C0_QUERY_DMA_FLUSH=1` | Se a grama para de sumir na espada e as manchas do `c72b` mudam. Pode travar ou custar FPS |
+| 12 | `EDEN_C0_ACQUIRE_RESUME=1` | Evita drenar o split em acquire já satisfeito. Conferir vegetação, névoa e troca de cena |
+| 13 | `EDEN_C0_FRONT_SHORT_SPIN=1`, depois `EDEN_C0_BACK_SHORT_SPIN=1` | Menos espera ativa nas threads da GPU. Pode aumentar wakeups |
 
 Com o conjunto decidido, a última etapa é uma build com ThinLTO e PGO.
 

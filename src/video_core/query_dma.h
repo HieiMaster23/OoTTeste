@@ -43,6 +43,31 @@ inline bool HasPendingQueries(const Tegra::MemoryManager& memory,
     return false;
 }
 
+/// EDEN_C0_QUERY_DMA_FLUSH=1 waits for query reports before macro DMA reads (Lichii #215), the
+/// candidate fix for Ocarina of Time's grass vanishing. It can stall, so it starts off.
+inline bool FlushEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_C0_QUERY_DMA_FLUSH");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+/// Writes the reports in [source, source + size) to guest memory, waiting for pending host
+/// results. Runs where the rasterizer's caches are owned.
+inline void FlushPending(const Tegra::MemoryManager& memory,
+                         VideoCore::RasterizerInterface& rasterizer, GPUVAddr source, size_t size) {
+    constexpr GPUVAddr page_size = 0x1000;
+    const GPUVAddr end = source + size;
+    for (GPUVAddr begin = source; begin < end;) {
+        const GPUVAddr page_end = (std::min)((begin & ~(page_size - 1)) + page_size, end);
+        if (const auto device = memory.GpuToCpuAddress(begin)) {
+            rasterizer.FlushQueryResults(*device, page_end - begin);
+        }
+        begin = page_end;
+    }
+}
+
 /// Logs a read of pending reports with the words it reads, and the same words once the next
 /// fence has popped and the results have landed.
 inline void Trace(const Tegra::MemoryManager& memory, VideoCore::RasterizerInterface& rasterizer,
