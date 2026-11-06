@@ -281,11 +281,13 @@ GraphicsPipeline::GraphicsPipeline(
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
     const std::array<const Shader::Info*, NUM_STAGES>& infos,
-    std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages)
+    std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages,
+    vk::ShaderModule fragment_fallback_)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)},
+      fragment_fallback{std::move(fragment_fallback_)},
       worker_only_build{worker_thread && static_cast<bool>(emit_stages)} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
@@ -357,7 +359,19 @@ GraphicsPipeline::GraphicsPipeline(
             }
             const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
             Validate();
-            MakePipeline(render_pass);
+            try {
+                MakePipeline(render_pass);
+            } catch (const vk::Exception&) {
+                if (!fragment_fallback) {
+                    throw;
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "Pipeline build failed, retrying fragment {:016x} without subgroup "
+                            "operations",
+                            key.unique_hashes[NUM_STAGES]);
+                spv_modules[NUM_STAGES - 1] = std::move(fragment_fallback);
+                MakePipeline(render_pass);
+            }
         } catch (const Shader::Exception& exception) {
             LOG_ERROR(Render_Vulkan, "Graphics pipeline {:016x}: {}", key.Hash(), exception.what());
             throw;
@@ -378,6 +392,7 @@ GraphicsPipeline::GraphicsPipeline(
         for (vk::ShaderModule& module : spv_modules) {
             module.reset();
         }
+        fragment_fallback.reset();
         if (worker_only_build) {
             const auto elapsed = std::chrono::steady_clock::now() - begin;
             static std::atomic<u32> logged{};
@@ -693,6 +708,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         texture_cache.UpdateRenderTargets(false);
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);
+        if (static const bool keep_views = std::getenv("EDEN_NX2_FRAME_DUMP_INPUTS_PS") != nullptr;
+            keep_views) {
+            dump_views.clear();
+            for (const auto& view : views) {
+                dump_views.push_back(view.id);
+            }
+        }
         if (scheduler.HasFragmentBarrier() &&
             (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
             scheduler.RequestOutsideRenderPassOperationContext();
@@ -1065,7 +1087,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .depthTestEnable = dynamic.depth_test_enable,
         .depthWriteEnable = dynamic.depth_write_enable,
         .depthCompareOp = dynamic.depth_test_enable
-                              ? MaxwellToVK::ComparisonOp(dynamic.DepthTestFunc())
+                              ? MaxwellToVK::DepthTestOp(dynamic.DepthTestFunc())
                               : VK_COMPARE_OP_ALWAYS,
         .depthBoundsTestEnable = dynamic.depth_bounds_enable && device.IsDepthBoundsSupported(),
         .stencilTestEnable = dynamic.stencil_enable,

@@ -1409,6 +1409,30 @@ void RasterizerVulkan::DispatchCompute() {
         FrameDumpBuffers(true, std::array{pipeline->ShaderHash()});
     }
 
+    // AMD proprietary: compute results are visible to whatever reads them next, indirect arguments
+    // included (culling output becomes counts now that culling sees its data).
+    // EDEN_C0_AMD_DISPATCH_BARRIERS=0 turns it off.
+    static const bool dispatch_barriers = [this] {
+        const char* const value = std::getenv("EDEN_C0_AMD_DISPATCH_BARRIERS");
+        return device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY &&
+               (value == nullptr || value[0] != '0');
+    }();
+    const auto record_post_dispatch_barrier = [this] {
+        if (!dispatch_barriers) {
+            return;
+        }
+        static constexpr VkMemoryBarrier POST_DISPATCH_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        };
+        scheduler.Record([](vk::CommandBuffer cmdbuf) {
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, POST_DISPATCH_BARRIER);
+        });
+    };
+
     const auto& qmd{kepler_compute->launch_description};
     auto indirect_address = kepler_compute->GetIndirectComputeAddress();
     if (frame_dump.CapturingBuffers()) {
@@ -1430,6 +1454,21 @@ void RasterizerVulkan::DispatchCompute() {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         scheduler.RequestOutsideRenderPassOperationContext();
+        if (dispatch_barriers) {
+            // The direct path below has this barrier; this one also covers the indirect arguments.
+            static constexpr VkMemoryBarrier INDIRECT_READ_BARRIER{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+            };
+            scheduler.Record([](vk::CommandBuffer cmdbuf) {
+                cmdbuf.PipelineBarrier(
+                    vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0,
+                    INDIRECT_READ_BARRIER);
+            });
+        }
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
         scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),
                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
@@ -1440,6 +1479,7 @@ void RasterizerVulkan::DispatchCompute() {
                 cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
             });
         });
+        record_post_dispatch_barrier();
         SubmitNx2ListCopies();
         return;
     }
@@ -1471,6 +1511,7 @@ void RasterizerVulkan::DispatchCompute() {
             TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
         }
     });
+    record_post_dispatch_barrier();
     SubmitNx2ListCopies();
 
     // Log compute dispatch

@@ -956,6 +956,41 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
 
 /// Defines the functions that route global memory accesses and atomics to the storage buffer
 /// holding the address at run time.
+Id EmitContext::EmitArrayLength(Id structure) {
+    // The prebuilt sirit has no OpArrayLength. OpCompositeExtract with one literal index has the
+    // same layout (result type, result, operand, literal): FinishArrayLengths rewrites the opcode.
+    const Id result{OpCompositeExtract(U32[1], structure, 0U)};
+    array_length_results.push_back(result.value);
+    return result;
+}
+
+void EmitContext::FinishArrayLengths(std::vector<u32>& code) const {
+    if (array_length_results.empty()) {
+        return;
+    }
+    constexpr u32 OP_COMPOSITE_EXTRACT{81};
+    constexpr u32 OP_ARRAY_LENGTH{68};
+    constexpr u32 WORD_COUNT{5};
+    constexpr size_t HEADER_WORDS{5};
+    size_t rewritten{};
+    for (size_t word = HEADER_WORDS; word < code.size();) {
+        const u32 count{code[word] >> 16};
+        if (count == 0) {
+            throw LogicError("Malformed SPIR-V instruction at word {}", word);
+        }
+        if ((code[word] & 0xffff) == OP_COMPOSITE_EXTRACT && count == WORD_COUNT &&
+            std::ranges::find(array_length_results, code[word + 2]) !=
+                array_length_results.end()) {
+            code[word] = (WORD_COUNT << 16) | OP_ARRAY_LENGTH;
+            ++rewritten;
+        }
+        word += count;
+    }
+    if (rewritten != array_length_results.size()) {
+        throw LogicError("Rewrote {} of {} array lengths", rewritten, array_length_results.size());
+    }
+}
+
 void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     const Info& info{program.info};
     if (!info.uses_global_memory || !profile.support_int64) {
@@ -996,6 +1031,17 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             const auto load_word{[&](Id word) {
                 return OpLoad(U32[1], OpAccessChain(storage_types.U32.element, storage, zero, word));
             }};
+            if (profile.native_global_bounds_check) {
+                // A holder too short for the entry (or the null buffer) gives no pointer at all.
+                const Id next_word{OpIAdd(U32[1], word_index, Const(1U))};
+                const Id in_range{OpULessThan(U1, next_word, EmitArrayLength(storage))};
+                const Id checked_words{OpCompositeConstruct(
+                    U32[2], load_word(OpSelect(U32[1], in_range, word_index, zero)),
+                    load_word(OpSelect(U32[1], in_range, next_word, zero)))};
+                const Id checked_pointer{OpBitwiseAnd(U64, OpBitcast(U64, checked_words),
+                                                      Constant(U64, ssbo_align_mask))};
+                return OpSelect(U64, in_range, checked_pointer, Constant(U64, ~u64{0}));
+            }
             const Id pointer_words{OpCompositeConstruct(
                 U32[2], load_word(word_index), load_word(OpIAdd(U32[1], word_index, Const(1U))))};
             return OpBitwiseAnd(U64, OpBitcast(U64, pointer_words), Constant(U64, ssbo_align_mask));
@@ -1022,8 +1068,21 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             for (size_t index = 0; index < num_buffers; ++index) {
                 bases[index] = base_address(index);
                 const Id distance{OpISub(U64, addr, bases[index])};
-                const Id better{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, bases[index]),
-                                             OpULessThan(U1, distance, best_distance))};
+                Id better{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, bases[index]),
+                                       OpULessThan(U1, distance, best_distance))};
+                if (profile.native_global_bounds_check) {
+                    // Only a candidate whose binding really covers the access: not a null pointer
+                    // (every address lies "above" it), and not a closer buffer that ends before
+                    // the address when a farther one holds it. A read nothing covers returns 0 and
+                    // a write is dropped, as with robust access.
+                    const Id bound_bytes{OpUConvert(
+                        U64, OpShiftLeftLogical(U32[1], EmitArrayLength(ssbos[index].U32), Const(2U)))};
+                    const Id end{OpIAdd(U64, distance, Constant(U64, u64{1} << shift))};
+                    better = OpLogicalAnd(
+                        U1, better,
+                        OpLogicalAnd(U1, OpINotEqual(U1, bases[index], Constant(U64, u64{0})),
+                                     OpULessThanEqual(U1, end, bound_bytes)));
+                }
                 best_distance = OpSelect(U64, better, distance, best_distance);
                 best_index = OpSelect(U32[1], better, Const(static_cast<u32>(index)), best_index);
             }
@@ -1110,37 +1169,62 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     std::tie(load_global_func_u32x4, write_global_func_u32x4) =
         define(&StorageDefinitions::U32x4, storage_types.U32x4, U32[4], sizeof(u32[4]));
 
+    const auto uses_opcode{[&](IR::Opcode opcode) {
+        return std::ranges::any_of(program.blocks, [opcode](const IR::Block* block) {
+            return std::ranges::any_of(block->Instructions(), [opcode](const IR::Inst& inst) {
+                return inst.GetOpcode() == opcode;
+            });
+        });
+    }};
+    const bool uses_add{uses_opcode(IR::Opcode::GlobalAtomicIAdd32)};
+    const bool uses_umax{uses_opcode(IR::Opcode::GlobalAtomicUMax32)};
+    const bool uses_umin{uses_opcode(IR::Opcode::GlobalAtomicUMin32)};
+    const bool uses_smin{uses_opcode(IR::Opcode::GlobalAtomicSMin32)};
+    const bool uses_smax{uses_opcode(IR::Opcode::GlobalAtomicSMax32)};
+    if (!uses_add && !uses_umax && !uses_umin && !uses_smin && !uses_smax) {
+        return;
+    }
     if (!std::ranges::any_of(info.storage_buffers_descriptors, [&](const auto& descriptor) {
             return info.native_global_bounds || UsesNvnStorageDescriptor(info, descriptor);
         })) {
         return;
     }
-    for (const auto opcode : {IR::Opcode::GlobalAtomicIAdd32, IR::Opcode::GlobalAtomicUMax32}) {
-        if (!std::ranges::any_of(program.blocks, [opcode](const IR::Block* block) {
-                return std::ranges::any_of(block->Instructions(), [opcode](const IR::Inst& inst) {
-                    return inst.GetOpcode() == opcode;
-                });
-            })) {
-            continue;
-        }
+    const auto define_atomic{[&](auto&& atomic) {
         const Id function_type{TypeFunction(U32[1], U64, U32[1])};
-        const Id function{OpFunction(U32[1], spv::FunctionControlMask::MaskNone, function_type)};
-        if (opcode == IR::Opcode::GlobalAtomicIAdd32) {
-            atomic_add_global_func_u32 = function;
-        } else {
-            atomic_umax_global_func_u32 = function;
-        }
+        const Id func_id{OpFunction(U32[1], spv::FunctionControlMask::MaskNone, function_type)};
         const Id address{OpFunctionParameter(U64)};
         const Id value{OpFunctionParameter(U32[1])};
         const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
         define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2,
-                    [&](Id pointer) {
-                        OpReturnValue(opcode == IR::Opcode::GlobalAtomicIAdd32
-                                          ? OpAtomicIAdd(U32[1], pointer, scope, u32_zero_value, value)
-                                          : OpAtomicUMax(U32[1], pointer, scope, u32_zero_value, value));
-                    });
+                    [&](Id pointer) { OpReturnValue(atomic(pointer, scope, value)); });
         OpReturnValue(u32_zero_value);
         OpFunctionEnd();
+        return func_id;
+    }};
+    if (uses_add) {
+        atomic_add_global_func_u32 = define_atomic([&](Id pointer, Id scope, Id value) {
+            return OpAtomicIAdd(U32[1], pointer, scope, u32_zero_value, value);
+        });
+    }
+    if (uses_umax) {
+        atomic_umax_global_func_u32 = define_atomic([&](Id pointer, Id scope, Id value) {
+            return OpAtomicUMax(U32[1], pointer, scope, u32_zero_value, value);
+        });
+    }
+    if (uses_umin) {
+        atomic_umin_global_func_u32 = define_atomic([&](Id pointer, Id scope, Id value) {
+            return OpAtomicUMin(U32[1], pointer, scope, u32_zero_value, value);
+        });
+    }
+    if (uses_smin) {
+        atomic_smin_global_func_u32 = define_atomic([&](Id pointer, Id scope, Id value) {
+            return OpAtomicSMin(U32[1], pointer, scope, u32_zero_value, value);
+        });
+    }
+    if (uses_smax) {
+        atomic_smax_global_func_u32 = define_atomic([&](Id pointer, Id scope, Id value) {
+            return OpAtomicSMax(U32[1], pointer, scope, u32_zero_value, value);
+        });
     }
     if (std::ranges::any_of(program.blocks, [](const IR::Block* block) {
             return std::ranges::any_of(block->Instructions(), [](const IR::Inst& inst) {

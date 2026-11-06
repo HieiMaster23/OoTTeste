@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <optional>
@@ -1022,6 +1023,12 @@ std::optional<StorageBufferAddr> TrackPointerAddend(const LowAddrInfo& addr,
     return tied || (!legacy_nearest && candidates.size() != 1) ? std::nullopt : result;
 }
 
+/// Test switches for the pointer searches: EDEN_C0_PTR_<name>=0 turns one off.
+bool PointerSearchEnabled(const char* name) {
+    const char* const value = std::getenv(name);
+    return value == nullptr || value[0] != '0';
+}
+
 /// The first slot and stride of a pointer array read at a dynamic constant buffer offset:
 /// (index << shift) + base or index * stride + base.
 std::optional<std::pair<u32, u32>> DynamicPointerSlots(const IR::Value& offset) {
@@ -1114,7 +1121,8 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
         case IR::Opcode::GetCbufU32x2: {
             const IR::Value index{inst->Arg(0)};
             const IR::Value offset{inst->Arg(1)};
-            if (index.IsImmediate() && !offset.IsImmediate()) {
+            static const bool search_dynamic{PointerSearchEnabled("EDEN_C0_PTR_DYNAMIC")};
+            if (search_dynamic && index.IsImmediate() && !offset.IsImmediate()) {
                 static constexpr u32 max_slots{16};
                 small_vector<std::pair<u32, u32>, 4> slots;
                 std::unordered_set<const IR::Inst*> slot_visited;
@@ -1164,6 +1172,10 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
             }
             break;
         case IR::Opcode::LoadGlobal64: {
+            static const bool search_loaded{PointerSearchEnabled("EDEN_C0_PTR_LOADED")};
+            if (!search_loaded) {
+                break;
+            }
             // A pointer loaded from the memory a constant buffer pointer points to (the binding
             // reads it again for every dispatch and draw).
             // The table address: a tracked low word, or a constant buffer pointer packed whole.
@@ -1202,6 +1214,10 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
             // candidates, bound only in the bindings the other storage buffers leave free.
             const auto add = [&](const StorageBufferAddr& pointer, bool table) {
                 if (std::ranges::find(candidates, pointer) != candidates.end()) {
+                    return;
+                }
+                static const bool search_tables{PointerSearchEnabled("EDEN_C0_PTR_TABLES")};
+                if (table && !search_tables) {
                     return;
                 }
                 if (table && env.ShaderStage() != Stage::Compute) {

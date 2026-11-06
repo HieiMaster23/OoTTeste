@@ -31,8 +31,15 @@ struct HostVertexBinding;
 
 class BufferCacheRuntime;
 
+/// Size of the null buffer, for devices without null descriptors.
+inline constexpr u32 NULL_BUFFER_BYTES = 64;
+
 class Buffer : public VideoCommon::BufferBase {
 public:
+    [[nodiscard]] bool IsNull() const noexcept {
+        return is_null;
+    }
+
     explicit Buffer(BufferCacheRuntime&, VideoCommon::NullBufferParams null_params);
     explicit Buffer(BufferCacheRuntime& runtime, VAddr cpu_addr_, u64 size_bytes_,
                     bool sparse_compatible_);
@@ -287,7 +294,10 @@ private:
         if (handle == VK_NULL_HANDLE) {
             guest_descriptor_queue.AddBuffer(handle, 0, 0, VK_WHOLE_SIZE);
         } else {
-            guest_descriptor_queue.AddBuffer(handle, buffer.DeviceAddress(), offset, size);
+            // A null binding on a device without null descriptors: a range of 0 is invalid.
+            guest_descriptor_queue.AddBuffer(handle, buffer.DeviceAddress(), offset,
+                                             size == 0 && buffer.IsNull() ? NULL_BUFFER_BYTES
+                                                                          : size);
         }
     }
 

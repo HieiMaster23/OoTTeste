@@ -113,6 +113,8 @@ struct Profile {
 
     u64 min_ssbo_alignment{};
     u32 max_user_clip_distances{};
+    /// Check native global accesses against the bound range in the shader (AMD proprietary).
+    bool native_global_bounds_check{};
 
     bool SupportsSubgroupStage(Stage stage) const {
         return (supported_subgroup_stages & (1u << static_cast<u32>(stage))) != 0;

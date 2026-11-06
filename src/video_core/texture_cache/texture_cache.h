@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <numeric>
 #include <cstdlib>
 #include <limits>
@@ -146,12 +147,34 @@ void TextureCache<P>::RunGarbageCollector() {
             const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
             return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
         }();
-        ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
+        // Only while memory allows: kept at critical usage, OoT's Saria cutscene filled the GPU
+        // memory (images in host memory, then unbacked) and the game crashed. Near the limit
+        // the age shrinks to 120 frames; at the limit the collector evicts as usual.
+        if (!aggressive_mode) {
+            ticks_to_destroy = (std::max)(ticks_to_destroy,
+                                          high_priority_mode ? (std::min)(min_age, u64{120})
+                                                             : min_age);
+        }
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
     };
+    // Below the expected memory nothing is urgent: deleting an image can take a millisecond
+    // (its overlaps and aliases, framebuffers and views go with it) and the collector deleted
+    // up to 10 a frame, a sixth of the GPU back thread in OoT's fields. Spend at most
+    // EDEN_NX2_TC_GC_BUDGET_US (default 300) per frame there; under pressure, no limit.
+    static const s64 gc_budget_ns = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_GC_BUDGET_US");
+        return (value != nullptr ? std::strtoll(value, nullptr, 10) : 300LL) * 1000LL;
+    }();
+    const auto gc_start = std::chrono::steady_clock::now();
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly](ImageId image_id) {
+                          &evict_old_costly, gc_start](ImageId image_id) {
         if (num_iterations == 0) {
+            return true;
+        }
+        if (!high_priority_mode && gc_budget_ns > 0 &&
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - gc_start)
+                    .count() >= gc_budget_ns) {
             return true;
         }
         --num_iterations;
@@ -1081,6 +1104,13 @@ template <class P>
 bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
                                 const Tegra::Engines::Fermi2D::Surface& src,
                                 const Tegra::Engines::Fermi2D::Config& copy) {
+    // A deferred clear parked before this copy has to land before it: realizing it afterwards
+    // starts its clear pass after the copy and wipes what the copy wrote. That is what made
+    // Ocarina of Time draw its terrain layer over the scene (#101): the game clears the
+    // occlusion depth, blits the scene depth over it, and reads it back during the layer draw.
+    // GetFramebufferId only flushes when it creates a framebuffer, so the bug starts on the
+    // second frame. Texture cache copies bypass render passes and keep stream order here.
+    runtime.FlushDeferredClear();
     const auto result = GetBlitImages(dst, src, copy);
     if (!result) {
         return false;
@@ -1094,6 +1124,26 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
 
     Image& dst_image = slot_images[dst_id];
     Image& src_image = slot_images[src_id];
+    if (static const u64 trace_destination = [] {
+            const char* value = std::getenv("EDEN_NX2_TRACE_DST");
+            return value ? std::strtoull(value, nullptr, 16) : 0ULL;
+        }();
+        trace_destination != 0 && dst.Address() == trace_destination) {
+        static u32 traced{};
+        if (traced++ < 16) {
+            LOG_INFO(HW_GPU,
+                     "nx2 blit images: src id={} addr={:#x} {}x{} format={} flags={:#x} "
+                     "samples={} | dst id={} addr={:#x} {}x{} format={} flags={:#x} samples={} "
+                     "| blit formats src={} dst={}",
+                     src_id.index, src_image.gpu_addr, src_image.info.size.width,
+                     src_image.info.size.height, static_cast<u32>(src_image.info.format),
+                     static_cast<u32>(src_image.flags), src_image.info.num_samples, dst_id.index,
+                     dst_image.gpu_addr, dst_image.info.size.width, dst_image.info.size.height,
+                     static_cast<u32>(dst_image.info.format), static_cast<u32>(dst_image.flags),
+                     dst_image.info.num_samples, static_cast<u32>(images.src_format),
+                     static_cast<u32>(images.dst_format));
+        }
+    }
     if (True(dst_image.flags & ImageFlagBits::Unbacked)) {
         static u32 logged{};
         if (logged++ < 64) {
@@ -2990,6 +3040,8 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr) 
 template <class P>
 std::pair<u32, u32> TextureCache<P>::PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                      bool mark_as_modified) {
+    // As in BlitImage: land a parked deferred clear before the DMA write.
+    runtime.FlushDeferredClear();
     const auto& image = slot_images[dst_id];
     const auto base = image.TryFindBase(base_addr);
     PrepareImage(dst_id, mark_as_modified, false);
@@ -3039,7 +3091,22 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
         return ImageViewId{};
     }
     const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
-    return FindRenderTargetView(info, gpu_addr);
+    const ImageViewId view_id = FindRenderTargetView(info, gpu_addr);
+    if (static const u64 trace_destination = [] {
+            const char* value = std::getenv("EDEN_NX2_TRACE_DST");
+            return value ? std::strtoull(value, nullptr, 16) : 0ULL;
+        }();
+        trace_destination != 0 && gpu_addr == trace_destination && view_id) {
+        static u32 traced{};
+        if (traced++ < 16) {
+            const ImageView& view = slot_image_views[view_id];
+            const Image& image = slot_images[view.image_id];
+            LOG_INFO(HW_GPU, "nx2 traced depth bound: image id={} {}x{} format={} flags={:#x}",
+                     view.image_id.index, image.info.size.width, image.info.size.height,
+                     static_cast<u32>(image.info.format), static_cast<u32>(image.flags));
+        }
+    }
+    return view_id;
 }
 
 template <class P>
@@ -3736,6 +3803,8 @@ void TextureCache<P>::PrepareImageView(ImageViewId image_view_id, bool is_modifi
 
 template <class P>
 void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies) {
+    // As in BlitImage: land a parked deferred clear before the copy overwrites the image.
+    runtime.FlushDeferredClear();
     Image& dst = slot_images[dst_id];
     Image& src = slot_images[src_id];
     if (True(dst.flags & ImageFlagBits::UnwrittenSparse) ||

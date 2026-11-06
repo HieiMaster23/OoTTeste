@@ -704,9 +704,15 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
         }
         ssbo_addr = holder + indirect_offset;
     }
+    // EDEN_C0_PTR_GFX_SIZE=0: native graphics pointers are sized by the word after them again.
+    static const bool native_graphics_size = [] {
+        const char* const value = std::getenv("EDEN_C0_PTR_GFX_SIZE");
+        return value == nullptr || value[0] != '0';
+    }();
     channel_state->storage_buffers[stage][ssbo_index] =
         StorageBufferBinding(ssbo_addr, cbuf_index, is_written,
-                             maxwell3d->GetNativeMacroEngine().native_turing ||
+                             (native_graphics_size &&
+                              maxwell3d->GetNativeMacroEngine().native_turing) ||
                                  indirect_offset != ~0U,
                              indirect_offset != ~0U);
     if (indirect_offset != ~0U) {
@@ -1322,6 +1328,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
     // the memory tracker, leaving stale host contents, so upload such a bank again once per frame.
+    // Copied directly: marking it CPU-modified unprotected and reprotected its pages each frame.
     if (has_host_buffer && (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
         size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
         (Nx2Perf::Verify() || !native_indirect_uniforms_this_frame.contains(device_addr)) &&
@@ -1333,8 +1340,14 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                device_memory.template GetPointer<u8>(device_addr + mapped_size) != nullptr) {
             mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
         }
-        if (mapped_size != 0) {
-            memory_tracker.MarkRegionAsCpuModified(device_addr, (std::min<u64>)(mapped_size, size));
+        const u64 upload_size = (std::min<u64>)(mapped_size, size);
+        if (upload_size != 0) {
+            std::array<BufferCopy, 1> copies{BufferCopy{
+                .src_offset = 0,
+                .dst_offset = buffer.Offset(device_addr),
+                .size = upload_size,
+            }};
+            UploadMemory(buffer, upload_size, upload_size, copies);
         }
     }
     const bool use_fast_buffer = needs_alignment_stream
@@ -1510,7 +1523,7 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
         buffer.MarkUsage(offset, size);
 
         if (is_written) {
-            MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
+            MarkWrittenBuffer(binding.buffer_id, binding.device_addr, WrittenStorageMarkSize(size));
         }
 
         if constexpr (NEEDS_BIND_STORAGE_INDEX) {
@@ -1657,7 +1670,8 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         buffer.MarkUsage(offset, size);
 
         if (is_written) {
-            MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size, true);
+            MarkWrittenBuffer(binding.buffer_id, binding.device_addr, WrittenStorageMarkSize(size),
+                              true);
         }
 
         if constexpr (NEEDS_BIND_STORAGE_INDEX) {
@@ -2837,7 +2851,12 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         // it (Ocarina of Time's grass instances lie 12-18 MiB past theirs): bound to the end of
         // its mapping, up to 64 MiB. The 8 MiB cap made those reads return 0 and culled every
         // blade. Written pools keep the cap: a write marks the whole binding GPU-modified.
-        if (table_pointer && !is_written) {
+        // EDEN_C0_PTR_TABLE_64=0 keeps the 8 MiB cap.
+        static const bool table_64 = [] {
+            const char* const value = std::getenv("EDEN_C0_PTR_TABLE_64");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (table_64 && table_pointer && !is_written) {
             return (std::min)(memory_layout_size, static_cast<u32>(64_MiB));
         }
         // A native (Switch 2) compute program's pointer is bare: the word after it is another

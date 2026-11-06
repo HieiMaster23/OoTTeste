@@ -266,8 +266,15 @@ size_t GenericEnvironment::ReadSizeBytes() const noexcept {
     return read_highest - read_lowest + INST_SIZE;
 }
 
+const char* GenericEnvironment::DebugWhyNotSerializable() const noexcept {
+    if (has_unbound_instructions) {
+        return "read instructions outside its cached code";
+    }
+    return "has a native trap prefix";
+}
+
 bool GenericEnvironment::CanBeSerialized() const noexcept {
-    return !has_unbound_instructions && (!lowered_native || lowered_native->trap_prefix.empty());
+    return !has_unbound_instructions;
 }
 
 bool GenericEnvironment::HasNativeInstructions() const {
@@ -343,6 +350,11 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
         if (stage == Shader::Stage::Geometry) {
             file.write(reinterpret_cast<const char*>(&gp_passthrough_mask),
                        sizeof(gp_passthrough_mask));
+        }
+        if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
+            file.write(reinterpret_cast<const char*>(&mesh_registers), sizeof(mesh_registers))
+                .write(reinterpret_cast<const char*>(&mesh_primitive_header),
+                       sizeof(mesh_primitive_header));
         }
     }
 }
@@ -1110,6 +1122,11 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
         if (stage == Shader::Stage::Geometry) {
             file.read(reinterpret_cast<char*>(&gp_passthrough_mask), sizeof(gp_passthrough_mask));
         }
+        if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
+            file.read(reinterpret_cast<char*>(&mesh_registers), sizeof(mesh_registers))
+                .read(reinterpret_cast<char*>(&mesh_primitive_header),
+                      sizeof(mesh_primitive_header));
+        }
     }
     // Native programs fold bank 1 reads as they did when they were built.
     is_proprietary_driver = texture_bound == 2 || Shader::Ampere::HasNativeAddressMap(code);
@@ -1227,6 +1244,14 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
             .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
     }
     if (!std::ranges::all_of(envs, &GenericEnvironment::CanBeSerialized)) {
+        if (static std::atomic<u32> logged{}; logged.fetch_add(1) < 32) {
+            for (const GenericEnvironment* const env : envs) {
+                if (!env->CanBeSerialized()) {
+                    LOG_INFO(Render_Vulkan, "Pipeline not stored on disk: a stage {}",
+                             env->DebugWhyNotSerializable());
+                }
+            }
+        }
         return;
     }
     const u32 num_envs{static_cast<u32>(envs.size())};

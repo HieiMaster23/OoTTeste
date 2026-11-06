@@ -348,6 +348,9 @@ public:
     Id atomic_add_global_func_u32{};
     Id atomic_umax_global_func_u32{};
     Id atomic_cas_global_func_u32{};
+    Id atomic_umin_global_func_u32{};
+    Id atomic_smin_global_func_u32{};
+    Id atomic_smax_global_func_u32{};
 
     bool need_input_position_indirect{};
     Id input_position{};
@@ -367,6 +370,8 @@ public:
 
     std::array<Id, 2> software_matrix_functions{};
     std::vector<Id> interfaces;
+    /// Rewrites the placeholders of EmitArrayLength in the assembled module.
+    void FinishArrayLengths(std::vector<u32>& code) const;
     std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
 
     // Task and mesh programs. Their stage buffer: the task's output region is the task payload
@@ -426,7 +431,9 @@ private:
     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
     void DefineAttributeMemAccess(const Info& info);
     void DefineWriteStorageCasLoopFunction(const Info& info);
+    std::vector<u32> array_length_results;
     void DefineGlobalMemoryFunctions(const IR::Program& program);
+    [[nodiscard]] Id EmitArrayLength(Id structure);
     void DefineRescalingInput(const Info& info);
     void DefineRescalingInputPushConstant();
     void DefineRescalingInputUniformConstant();

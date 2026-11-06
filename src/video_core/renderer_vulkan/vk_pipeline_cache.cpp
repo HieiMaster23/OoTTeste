@@ -572,7 +572,12 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
-        .max_user_clip_distances = device.GetMaxUserClipDistances()
+        .max_user_clip_distances = device.GetMaxUserClipDistances(),
+        // EDEN_C0_AMD_BOUNDS=0 turns it off.
+        .native_global_bounds_check = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY && [] {
+            const char* const value = std::getenv("EDEN_C0_AMD_BOUNDS");
+            return value == nullptr || value[0] != '0';
+        }(),
     };
 
     host_info = Shader::HostTranslateInfo{
@@ -717,6 +722,8 @@ std::unordered_map<u64, u8> LoadUsedPipelines(const std::filesystem::path& path,
 // memory built before the game started; the list is only saved at exit or after two minutes, so a
 // boot that ran out of memory never saved one and the next boot did the same.
 constexpr size_t MaxPipelinesWithoutUsedList = 3000;
+// Cached graphics pipelines built at boot whatever the list says (~0.45 MB of driver memory each).
+constexpr size_t MinPipelinesAlwaysBuilt = 2000;
 
 // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
 bool PreloadAllPipelines() {
@@ -892,15 +899,6 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
 
-        // Task/mesh pipelines are not stored (their mesh registers are not in the format); skip
-        // any that were.
-        if (std::ranges::any_of(envs, [](const FileEnvironment& env) {
-                return env.ShaderStage() == Shader::Stage::Task ||
-                       env.ShaderStage() == Shader::Stage::Mesh;
-            })) {
-            return;
-        }
-
         if ((key.state.extended_dynamic_state != 0) !=
                 dynamic_features.has_extended_dynamic_state ||
             (key.state.extended_dynamic_state_2 != 0) !=
@@ -931,7 +929,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
         const u64 hash = key.Hash();
         disk_pipelines.insert(hash);
-        if (!PreloadAllPipelines() &&
+        // A cache this small is built whole at boot: a pipeline left for later is built on the
+        // GPU thread mid-game (6-30 ms each, Ocarina of Time built ~200 of them that way in two
+        // minutes of a session, stuttering each time a place was entered again).
+        if (!PreloadAllPipelines() && queued_graphics >= MinPipelinesAlwaysBuilt &&
             (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
                                     : !used_pipelines.contains(hash))) {
             ++skipped_pipelines;
@@ -951,6 +952,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             std::scoped_lock lock{state.mutex};
             if (pipeline) {
                 graphics_cache.emplace(key, std::move(pipeline));
+            } else if (static u32 failed{}; failed++ < 16) {
+                LOG_INFO(Render_Vulkan, "Cached graphics pipeline {:016x} failed to build at boot",
+                         key.Hash());
             }
             ++state.built;
             if (state.has_loaded) {
@@ -1165,6 +1169,25 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     return discard ? nullptr : pipeline;
 }
 
+namespace {
+// AMD's shader compiler can fault on fragment shaders with subgroup ballot/shuffle code. Those
+// pipelines get a second fragment module without subgroup operations to retry with.
+// EDEN_C0_AMD_SUBGROUP_FALLBACK=0 turns it off.
+bool AmdSubgroupFallbackEnabled(const Device& device) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_C0_AMD_SUBGROUP_FALLBACK");
+        return value == nullptr || value[0] != '0';
+    }();
+    const VkDriverIdKHR id = device.GetDriverID();
+    return enabled && (id == VK_DRIVER_ID_AMD_PROPRIETARY || id == VK_DRIVER_ID_AMD_OPEN_SOURCE);
+}
+
+bool UsesSubgroupOperations(const Shader::Info& info) {
+    return info.uses_subgroup_vote || info.uses_subgroup_mask || info.uses_subgroup_shuffles ||
+           info.uses_subgroup_invocation_id;
+}
+} // Anonymous namespace
+
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
@@ -1180,6 +1203,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // Layer passthrough generation for devices without VK_EXT_shader_viewport_index_layer
     Shader::IR::Program* layer_source_program{};
 
+    std::array<Shader::Environment*, Maxwell::MaxShaderProgram> stage_envs{};
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
         const bool is_emulated_stage = layer_source_program != nullptr &&
                                        index == static_cast<u32>(Maxwell::ShaderType::Geometry);
@@ -1205,6 +1229,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         Shader::Environment& env{*envs[env_index]};
         ++env_index;
+        stage_envs[index] = &env;
 
         // Without VK_EXT_mesh_shader the driver cannot build a task/mesh pipeline; the draw is
         // skipped (see the pipeline check in the rasterizer).
@@ -1277,6 +1302,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     }
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
+    vk::ShaderModule fragment_fallback;
+    // The fallback is translated anew from the guest environments, so a pipeline that needs one
+    // emits its stages here, not on the worker.
+    bool needs_fragment_fallback{};
+    if (AmdSubgroupFallbackEnabled(device) &&
+        profile.SupportsSubgroupStage(Shader::Stage::Fragment)) {
+        for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+            if (key.unique_hashes[index] != 0 && programs[index].stage == Shader::Stage::Fragment &&
+                UsesSubgroupOperations(programs[index].info)) {
+                needs_fragment_fallback = true;
+            }
+        }
+    }
+    const bool defer_emission{emit_pools != nullptr && !needs_fragment_fallback};
     std::array<std::optional<Shader::RuntimeInfo>, Maxwell::MaxShaderStage> deferred_runtime_infos;
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
 
@@ -1297,15 +1336,33 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
         ConvertLegacyToGeneric(program, runtime_info);
-        if (emit_pools) {
+        if (defer_emission) {
             deferred_runtime_infos[stage_index] = runtime_info;
             if (VideoCommon::Nx2Perf::Verify()) {
                 reference_spirv[stage_index] = EmitSPIRV(profile, runtime_info, program, binding);
             }
         } else {
             const auto begin = std::chrono::steady_clock::now();
+            const Shader::Backend::Bindings fragment_binding{binding};
             modules[stage_index] = EmitShaderModule(device, profile, runtime_info, program, binding,
                                                    key.unique_hashes[index], stage_index);
+            if (needs_fragment_fallback && program.stage == Shader::Stage::Fragment) {
+                // Emission consumes pseudo-operations of the IR, so the fallback is translated anew.
+                Shader::Environment& env{*stage_envs[index]};
+                const u32 cfg_offset{
+                    static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+                Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, false);
+                Shader::IR::Program fallback_program{
+                    TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+                ConvertLegacyToGeneric(fallback_program, runtime_info);
+                Shader::Profile fallback_profile{profile};
+                fallback_profile.supported_subgroup_stages &=
+                    ~(1u << static_cast<u32>(Shader::Stage::Fragment));
+                Shader::Backend::Bindings fallback_binding{fragment_binding};
+                const std::vector<u32> fallback_code{
+                    EmitSPIRV(fallback_profile, runtime_info, fallback_program, fallback_binding)};
+                fragment_fallback = BuildShader(device, fallback_code);
+            }
             if (build_in_parallel) {
                 AddRuntimeSpirvTime(0, begin);
             }
@@ -1313,7 +1370,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         previous_stage = &program;
     }
     std::function<std::array<vk::ShaderModule, Maxwell::MaxShaderStage>()> emit_stages;
-    if (emit_pools) {
+    if (defer_emission) {
         auto job = std::make_shared<DeferredStages>();
         job->reservation = std::move(reservation);
         job->pools = emit_pools;
@@ -1354,7 +1411,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     return std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
-        render_pass_cache, key, std::move(modules), infos, std::move(emit_stages));
+        render_pass_cache, key, std::move(modules), infos, std::move(emit_stages),
+        std::move(fragment_fallback));
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
@@ -1455,12 +1513,6 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }
-    if (pipeline->IsMeshPipeline()) {
-        // Not stored: task and mesh programs are translated with the mesh registers, which the
-        // cache format does not carry. The few of them rebuild quickly from the driver cache.
-        QueueVulkanPipelineCacheFlush();
-        return pipeline;
-    }
     if (disk_pipelines.contains(graphics_key.Hash())) {
         // In the disk cache already, only not built at boot.
         QueueVulkanPipelineCacheFlush();
@@ -1553,7 +1605,18 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                     max_shared_memory / 1024);
         program.shared_memory_size = max_shared_memory;
     }
-    const std::vector<u32> code{EmitSPIRV(profile, program)};
+    // A compute shader that uses warp operations is built with requiredSubgroupSize = 32 (see
+    // ComputePipeline), so on a GPU whose subgroups can be wider (AMD wave64) its subgroup is
+    // still exactly one guest warp. Emitting the wide-warp emulation there only costs time: every
+    // shuffle, vote and ballot turns into extra index math, and some into chains of broadcasts.
+    Shader::Profile compute_profile{profile};
+    if (profile.warp_size_potentially_larger_than_guest &&
+        device.IsExtSubgroupSizeControlSupported() &&
+        device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT) &&
+        device.GetMinSubgroupSize() <= GuestWarpSize) {
+        compute_profile.warp_size_potentially_larger_than_guest = false;
+    }
+    const std::vector<u32> code{EmitSPIRV(compute_profile, program)};
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
 

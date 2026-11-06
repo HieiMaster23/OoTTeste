@@ -88,11 +88,15 @@ public:
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
-        std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {});
+        std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {},
+        vk::ShaderModule fragment_fallback = {});
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
+    // Image views of the last configured draw (frame dump input capture only).
+    std::vector<VideoCommon::ImageViewId> dump_views;
+
     const std::array<u64, 6>& ShaderHashes() const noexcept {
         return key.unique_hashes;
     }
@@ -204,6 +208,9 @@ private:
     u64 last_use_frame{};
 
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
+    // Fragment stage emitted without subgroup operations, tried when the driver faults on the
+    // pipeline (AMD's compiler crashes on some ballot/shuffle fragment shaders).
+    vk::ShaderModule fragment_fallback;
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
     std::array<u32, 5> enabled_uniform_buffer_masks{};

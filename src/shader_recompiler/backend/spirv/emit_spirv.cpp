@@ -658,6 +658,7 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     SetupTransformFeedbackCapabilities(ctx, main);
     PatchPhiNodes(program, ctx);
     std::vector<u32> code{ctx.Assemble()};
+    ctx.FinishArrayLengths(code);
     RewriteOpcodes(code, ctx.opcode_rewrites);
     PatchMeshInstructions(code, ctx);
     return code;

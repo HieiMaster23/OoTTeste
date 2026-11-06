@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -772,9 +773,68 @@ PipelineLayout Device::CreatePipelineLayout(const VkPipelineLayoutCreateInfo& ci
     return PipelineLayout(object, handle, *dld);
 }
 
+namespace {
+
+#ifdef _WIN32
+// The AMD driver's shader compiler can fault on some SPIR-V (an access violation inside
+// vkCreate*Pipelines on the pipeline builder thread, title 0400486024DEC000). Such a fault becomes
+// a failed build, which callers already handle by skipping the pipeline, instead of ending the
+// process. EDEN_C0_GUARD_PIPELINES=0 turns it off.
+bool GuardPipelines() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_C0_GUARD_PIPELINES");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+int GuardFilter(unsigned long code, unsigned long* out_code) {
+    // C++ exceptions (0xE06D7363) and debugger breakpoints keep their normal path.
+    if (code == 0xE06D7363UL || code == 0x80000003UL) {
+        return 0; // EXCEPTION_CONTINUE_SEARCH
+    }
+    *out_code = code;
+    return 1; // EXCEPTION_EXECUTE_HANDLER
+}
+
+VkResult GuardedGraphics(PFN_vkCreateGraphicsPipelines function, VkDevice device,
+                         VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci,
+                         VkPipeline* object, unsigned long* fault) {
+    __try {
+        return function(device, cache, 1, ci, nullptr, object);
+    } __except (GuardFilter(GetExceptionCode(), fault)) {
+        return VK_ERROR_UNKNOWN;
+    }
+}
+
+VkResult GuardedCompute(PFN_vkCreateComputePipelines function, VkDevice device,
+                        VkPipelineCache cache, const VkComputePipelineCreateInfo* ci,
+                        VkPipeline* object, unsigned long* fault) {
+    __try {
+        return function(device, cache, 1, ci, nullptr, object);
+    } __except (GuardFilter(GetExceptionCode(), fault)) {
+        return VK_ERROR_UNKNOWN;
+    }
+}
+#endif
+
+} // Anonymous namespace
+
 Pipeline Device::CreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci, VkPipelineCache cache) const {
     VkPipeline object = VK_NULL_HANDLE;
+#ifdef _WIN32
+    unsigned long fault = 0;
+    auto const result =
+        GuardPipelines()
+            ? GuardedGraphics(dld->vkCreateGraphicsPipelines, handle, cache, &ci, &object, &fault)
+            : dld->vkCreateGraphicsPipelines(handle, cache, 1, &ci, nullptr, &object);
+    if (fault != 0) {
+        LOG_CRITICAL(Render_Vulkan, "Driver fault {:#010x} while building a graphics pipeline",
+                     fault);
+    }
+#else
     auto const result = dld->vkCreateGraphicsPipelines(handle, cache, 1, &ci, nullptr, &object);
+#endif
     // Adreno 5xx drivers do not properly return when a graphics pipeline fails to be created
     // Some (unkown) Mali drivers also do not properly return
     // This result code is out of spec, but should be handled as "kinda working"
@@ -786,8 +846,21 @@ Pipeline Device::CreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci, 
 
 Pipeline Device::CreateComputePipeline(const VkComputePipelineCreateInfo& ci,
                                        VkPipelineCache cache) const {
-    VkPipeline object;
+    VkPipeline object = VK_NULL_HANDLE;
+#ifdef _WIN32
+    unsigned long fault = 0;
+    const VkResult result =
+        GuardPipelines()
+            ? GuardedCompute(dld->vkCreateComputePipelines, handle, cache, &ci, &object, &fault)
+            : dld->vkCreateComputePipelines(handle, cache, 1, &ci, nullptr, &object);
+    if (fault != 0) {
+        LOG_CRITICAL(Render_Vulkan, "Driver fault {:#010x} while building a compute pipeline",
+                     fault);
+    }
+    Check(result);
+#else
     Check(dld->vkCreateComputePipelines(handle, cache, 1, &ci, nullptr, &object));
+#endif
     return Pipeline(object, handle, *dld);
 }
 

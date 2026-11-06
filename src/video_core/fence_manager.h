@@ -17,6 +17,7 @@
 #include <vector>
 #include <queue>
 
+#include "video_core/nx2_kick.h"
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -81,7 +82,7 @@ public:
 
     void SignalFence(std::function<void()>&& func) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
-        const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
+        const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? (Settings::IsGPULevelHigh() || Nx2AccurateSync()) : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
@@ -152,6 +153,7 @@ public:
                 wait_cv.notify_all();
             });
             SignalFence(std::move(func));
+            SubmitDeferredWork();
             std::unique_lock lk(wait_mutex);
             wait_cv.wait(
                 lk, [&wait_finished] { return wait_finished.load(std::memory_order_relaxed); });
@@ -187,6 +189,7 @@ protected:
     virtual bool IsFenceSignaled(TFence& fence) const = 0;
     /// Waits until a fence has been signalled by the host GPU.
     virtual void WaitFence(TFence& fence) = 0;
+    virtual void SubmitDeferredWork() {}
 
     VideoCore::RasterizerInterface& rasterizer;
     Tegra::GPU& gpu;
@@ -294,6 +297,7 @@ private:
                     operation();
                 }
             }
+            Nx2GpuKick().Set();
             {
                 std::unique_lock lock(ring_guard);
                 for (Released& released : batch) {

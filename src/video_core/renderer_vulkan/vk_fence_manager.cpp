@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
+#include <cstdlib>
 
 #include "common/logging.h"
 #include "video_core/gpu_split.h"
@@ -68,6 +69,23 @@ void FenceManager::QueueFence(Fence& fence) {
 
 bool FenceManager::IsFenceSignaled(Fence& fence) const {
     return fence->IsSignaled();
+}
+
+// Opt-in adaptation of Lichii PR #149; preserve scheduler ownership.
+void FenceManager::SubmitDeferredWork() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_C0_SUBMIT_BEFORE_FENCE_WAIT");
+        return value && value[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active() || VideoCommon::GpuSplit::OnBackThread()) {
+        scheduler.FlushDeferred();
+    } else {
+        split.RequestIdleHook();
+    }
 }
 
 void FenceManager::WaitFence(Fence& fence) {
