@@ -281,7 +281,7 @@ GraphicsPipeline::GraphicsPipeline(
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
     const std::array<const Shader::Info*, NUM_STAGES>& infos,
-    std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages,
+    std::function<std::array<vk::ShaderModule, NUM_STAGES>(vk::ShaderModule&)> emit_stages,
     vk::ShaderModule fragment_fallback_)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
@@ -355,7 +355,7 @@ GraphicsPipeline::GraphicsPipeline(
         };
         try {
             if (emit_stages) {
-                spv_modules = emit_stages();
+                spv_modules = emit_stages(fragment_fallback);
             }
             const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
             Validate();

@@ -380,6 +380,7 @@ struct DeferredStages {
     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
     std::array<std::optional<Shader::RuntimeInfo>, Maxwell::MaxShaderStage> runtime_infos;
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
+    std::optional<Shader::IR::Program> fragment_fallback_program;
 };
 
 size_t GetTotalPipelineWorkers() {
@@ -1356,8 +1357,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
     vk::ShaderModule fragment_fallback;
-    // The fallback is translated anew from the guest environments, so a pipeline that needs one
-    // emits its stages here, not on the worker.
+    // Capture the fallback IR before guest environments leave the GPU thread.
+    std::optional<Shader::IR::Program> fragment_fallback_program;
     bool needs_fragment_fallback{};
     if (AmdSubgroupFallbackEnabled(device) &&
         profile.SupportsSubgroupStage(Shader::Stage::Fragment)) {
@@ -1368,7 +1369,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
         }
     }
-    const bool defer_emission{emit_pools != nullptr && !needs_fragment_fallback};
+    const bool defer_emission{emit_pools != nullptr};
+    if (build_in_parallel) {
+        LOG_INFO(Render_Vulkan,
+                 "Nx2Perf pipeline route: {:016x} deferred={} amd_fragment_fallback={} pool={}",
+                 key.Hash(), defer_emission, needs_fragment_fallback, emit_pools != nullptr);
+    }
     std::array<std::optional<Shader::RuntimeInfo>, Maxwell::MaxShaderStage> deferred_runtime_infos;
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
 
@@ -1389,6 +1395,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
         ConvertLegacyToGeneric(program, runtime_info);
+        if (needs_fragment_fallback && program.stage == Shader::Stage::Fragment) {
+            Shader::Environment& env{*stage_envs[index]};
+            const u32 cfg_offset{
+                static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, false);
+            fragment_fallback_program.emplace(
+                TranslateProgram(pools.inst, pools.block, env, cfg, host_info));
+            ConvertLegacyToGeneric(*fragment_fallback_program, runtime_info);
+        }
         if (defer_emission) {
             deferred_runtime_infos[stage_index] = runtime_info;
             if (VideoCommon::Nx2Perf::Verify()) {
@@ -1400,20 +1415,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             modules[stage_index] = EmitShaderModule(device, profile, runtime_info, program, binding,
                                                    key.unique_hashes[index], stage_index);
             if (needs_fragment_fallback && program.stage == Shader::Stage::Fragment) {
-                // Emission consumes pseudo-operations of the IR, so the fallback is translated anew.
-                Shader::Environment& env{*stage_envs[index]};
-                const u32 cfg_offset{
-                    static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
-                Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, false);
-                Shader::IR::Program fallback_program{
-                    TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
-                ConvertLegacyToGeneric(fallback_program, runtime_info);
                 Shader::Profile fallback_profile{profile};
                 fallback_profile.supported_subgroup_stages &=
                     ~(1u << static_cast<u32>(Shader::Stage::Fragment));
                 Shader::Backend::Bindings fallback_binding{fragment_binding};
                 const std::vector<u32> fallback_code{
-                    EmitSPIRV(fallback_profile, runtime_info, fallback_program, fallback_binding)};
+                    EmitSPIRV(fallback_profile, runtime_info, *fragment_fallback_program,
+                              fallback_binding)};
                 fragment_fallback = BuildShader(device, fallback_code);
             }
             if (build_in_parallel) {
@@ -1422,7 +1430,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         previous_stage = &program;
     }
-    std::function<std::array<vk::ShaderModule, Maxwell::MaxShaderStage>()> emit_stages;
+    std::function<std::array<vk::ShaderModule, Maxwell::MaxShaderStage>(vk::ShaderModule&)> emit_stages;
     if (defer_emission) {
         auto job = std::make_shared<DeferredStages>();
         job->reservation = std::move(reservation);
@@ -1430,21 +1438,34 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         job->programs = std::move(programs);
         job->runtime_infos = std::move(deferred_runtime_infos);
         job->reference_spirv = std::move(reference_spirv);
+        job->fragment_fallback_program = std::move(fragment_fallback_program);
         for (size_t stage = 0; stage < infos.size(); ++stage) {
             if (infos[stage]) {
                 infos[stage] = &job->programs[stage + 1].info;
             }
         }
-        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes]() mutable {
+        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes](
+                          vk::ShaderModule& fallback) mutable {
             const auto begin = std::chrono::steady_clock::now();
             std::array<vk::ShaderModule, Maxwell::MaxShaderStage> stage_modules;
             Shader::Backend::Bindings stage_binding;
             for (size_t stage = 0; stage < stage_modules.size(); ++stage) {
                 if (job->runtime_infos[stage]) {
+                    const Shader::Backend::Bindings fragment_binding{stage_binding};
                     stage_modules[stage] =
                         EmitShaderModule(device, profile, *job->runtime_infos[stage],
                                          job->programs[stage + 1], stage_binding,
                                          hashes[stage + 1], stage, job->reference_spirv[stage]);
+                    if (stage == stage_modules.size() - 1 && job->fragment_fallback_program) {
+                        Shader::Profile fallback_profile{profile};
+                        fallback_profile.supported_subgroup_stages &=
+                            ~(1u << static_cast<u32>(Shader::Stage::Fragment));
+                        Shader::Backend::Bindings fallback_binding{fragment_binding};
+                        const auto code = EmitSPIRV(fallback_profile, *job->runtime_infos[stage],
+                                                   *job->fragment_fallback_program,
+                                                   fallback_binding);
+                        fallback = BuildShader(device, code);
+                    }
                 }
             }
             auto pools = std::move(job->pools);

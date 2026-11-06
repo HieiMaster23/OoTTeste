@@ -88,7 +88,7 @@ public:
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
-        std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {},
+        std::function<std::array<vk::ShaderModule, NUM_STAGES>(vk::ShaderModule&)> emit_stages = {},
         vk::ShaderModule fragment_fallback = {});
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
