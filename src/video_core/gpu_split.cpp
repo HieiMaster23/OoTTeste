@@ -281,7 +281,11 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
 }
 
 void GpuSplit::Backoff(u32 spins, u64 target) {
-    if (spins < 16384) {
+    static const u32 spin_limit = [] {
+        const char* value = std::getenv("EDEN_C0_FRONT_SHORT_SPIN");
+        return value != nullptr && value[0] == '1' ? 256U : 16384U;
+    }();
+    if (spins < spin_limit) {
         Pause();
         return;
     }
@@ -450,6 +454,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
 #ifdef _WIN32
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
+    static const u32 idle_spins = [] {
+        const char* value = std::getenv("EDEN_C0_BACK_SHORT_SPIN");
+        return value != nullptr && value[0] == '1' ? 256U : 8192U;
+    }();
     u64 read_position = 0;
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
@@ -457,7 +465,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
             // The front usually sends more within microseconds: spin briefly before sleeping.
-            for (u32 spins = 0; spins < 8192 && available == read_position &&
+            for (u32 spins = 0; spins < idle_spins && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
                  ++spins) {
                 Pause();
