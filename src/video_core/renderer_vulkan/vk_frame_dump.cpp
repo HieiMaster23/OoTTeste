@@ -465,16 +465,22 @@ void FrameDump::NoteDispatchSampled(u64 shader_hash, std::span<const Sampled> te
 
 bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
                             std::span<BoundBuffer> buffers) {
+    static const bool repeat = [] {
+        const char* value = std::getenv("EDEN_C0_FRAME_BUFFER_REPEAT");
+        return value && std::string_view{value} == "1";
+    }();
     bool recorded = false;
     for (BoundBuffer& buffer : buffers) {
         const size_t program = compute ? 0 : buffer.stage + 1;
         const u64 shader = program < shader_hashes.size() ? shader_hashes[program] : 0;
         const std::tuple<u64, bool, u32, u64, u32> key{shader, buffer.storage, buffer.index,
                                                        buffer.device_addr, buffer.size};
-        if (std::ranges::find(seen_buffers, key) != seen_buffers.end()) {
+        if (!repeat && std::ranges::find(seen_buffers, key) != seen_buffers.end()) {
             continue;
         }
-        seen_buffers.push_back(key);
+        if (!repeat) {
+            seen_buffers.push_back(key);
+        }
         const std::string owner =
             compute ? fmt::format(R"("dispatch":{},"after_draws":{})", dispatches, draws)
                     : fmt::format(R"("pass":{},"draw":{})", pass_index, draws - 1);
@@ -484,6 +490,7 @@ bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
             owner, buffer.stage, shader, buffer.storage ? "storage" : "uniform", buffer.index,
             buffer.written, buffer.gpu_addr, buffer.device_addr, buffer.bound_size, buffer.size,
             buffer.gpu_modified, from_host ? "host" : "guest");
+        tags += fmt::format(R"(,"captured_offset":{})", buffer.captured_offset);
         if (!from_host) {
             Enqueue({.tags = std::move(tags), .data = std::move(buffer.guest), .raw = true});
             continue;
@@ -511,6 +518,19 @@ void FrameDump::NoteLaunch(u64 shader_hash, const std::array<u32, 3>& grid,
 
 void FrameDump::NoteDraw(std::span<const u64> shader_hashes) {
     ++draws;
+    static const bool trace = [] {
+        const char* value = std::getenv("EDEN_C0_FRAME_DRAW_TRACE");
+        return value && std::string_view{value} == "1";
+    }();
+    if (trace) {
+        std::string shaders;
+        for (const u64 hash : shader_hashes) {
+            shaders += fmt::format("{}\"{:016x}\"", shaders.empty() ? "" : ",", hash);
+        }
+        Enqueue({.tags = fmt::format(
+                     R"({{"kind":"draw","pass":{},"draw":{},"shaders":[{}]}})",
+                     pass_index, draws - 1, shaders)});
+    }
     for (const u64 hash : shader_hashes) {
         if (hash != 0 && pass_hashes.size() < 32 &&
             std::ranges::find(pass_hashes, hash) == pass_hashes.end()) {

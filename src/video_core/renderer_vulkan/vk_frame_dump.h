@@ -114,6 +114,7 @@ public:
         u64 device_addr;
         u32 bound_size;
         u32 size;
+        u32 captured_offset;
         bool gpu_modified;
         VkBuffer host;
         u32 host_offset;

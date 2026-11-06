@@ -1985,12 +1985,33 @@ bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shade
         const u32 mib = value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 4;
         return std::clamp(mib, 1U, 64U) << 20;
     }();
+    static const u32 BUFFER_OFFSET = [] {
+        const char* value = std::getenv("EDEN_C0_FRAME_BUFFER_OFFSET_MIB");
+        const u32 mib = value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0;
+        return std::min(mib, 64U) << 20;
+    }();
+    static const std::string SHADERS = [] {
+        const char* value = std::getenv("EDEN_C0_FRAME_BUFFER_SHADERS");
+        return value ? "," + std::string{value} + "," : std::string{};
+    }();
     std::vector<FrameDump::BoundBuffer> buffers;
     buffer_cache.ForEachBoundBuffer(compute, [&](u32 stage, bool storage, u32 index, bool written,
                                                  const auto& binding, u32 bound_size,
                                                  const auto* host, u32 host_offset) {
-        const u32 size = std::min(bound_size, BUFFER_CAP);
-        const bool gpu_modified = buffer_cache.IsRegionGpuModified(binding.device_addr, size);
+        const size_t program = compute ? 0 : stage + 1;
+        const u64 shader = program < shader_hashes.size() ? shader_hashes[program] : 0;
+        if (!SHADERS.empty() &&
+            SHADERS.find(fmt::format(",{:016x},", shader)) == std::string::npos) {
+            return;
+        }
+        // Window large pools; retain complete small argument and output buffers.
+        const u32 offset = storage && bound_size > BUFFER_CAP ? BUFFER_OFFSET : 0;
+        if (offset >= bound_size) {
+            return;
+        }
+        const u32 size = std::min(bound_size - offset, BUFFER_CAP);
+        const bool gpu_modified =
+            buffer_cache.IsRegionGpuModified(binding.device_addr + offset, size);
         FrameDump::BoundBuffer& buffer = buffers.emplace_back(FrameDump::BoundBuffer{
             .stage = stage,
             .storage = storage,
@@ -2000,14 +2021,15 @@ bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shade
             .device_addr = binding.device_addr,
             .bound_size = bound_size,
             .size = size,
+            .captured_offset = offset,
             .gpu_modified = gpu_modified,
             .host = host ? host->Handle() : VK_NULL_HANDLE,
-            .host_offset = host_offset,
+            .host_offset = host_offset + offset,
             .guest = {},
         });
         if (!gpu_modified || !host) {
             buffer.guest.resize(size);
-            device_memory.ReadBlockUnsafe(binding.device_addr, buffer.guest.data(), size);
+            device_memory.ReadBlockUnsafe(binding.device_addr + offset, buffer.guest.data(), size);
         }
     });
     return frame_dump.NoteBuffers(compute, shader_hashes, buffers);
