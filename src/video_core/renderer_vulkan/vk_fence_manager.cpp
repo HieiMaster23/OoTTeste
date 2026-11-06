@@ -71,17 +71,22 @@ bool FenceManager::IsFenceSignaled(Fence& fence) const {
     return fence->IsSignaled();
 }
 
-// Opt-in adaptation of Lichii PR #149; preserve scheduler ownership.
+// EDEN_C0_SUBMIT_BEFORE_FENCE_WAIT=1 (adapted from Lichii PR #149) also covers a fence waited on
+// outside the back thread, preserving scheduler ownership through the idle hook.
 void FenceManager::SubmitDeferredWork() {
-    static const bool enabled = [] {
+    static const bool outside_back = [] {
         const char* value = std::getenv("EDEN_C0_SUBMIT_BEFORE_FENCE_WAIT");
         return value && value[0] == '1';
     }();
-    if (!enabled) {
+    if (VideoCommon::GpuSplit::OnBackThread()) {
+        scheduler.FlushDeferred();
+        return;
+    }
+    if (!outside_back) {
         return;
     }
     auto& split = VideoCommon::GpuSplit::Get();
-    if (!split.Active() || VideoCommon::GpuSplit::OnBackThread()) {
+    if (!split.Active()) {
         scheduler.FlushDeferred();
     } else {
         split.RequestIdleHook();
