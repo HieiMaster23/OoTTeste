@@ -1110,9 +1110,19 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         };
         const auto& blend{key.state.attachments[index]};
         const std::array mask{blend.Mask()};
+        // A target the fragment shader doesn't export to is undefined in Vulkan while its writes
+        // are enabled. Ocarina of Time has a depth-only mask draw (fragment 4f5673eca06ebecb) with
+        // color writes on; AMD's driver leaves a black line along its surviving pixels.
+        // EDEN_C0_FRAG_EXPORT_MASK=0 keeps the guest's mask. With EDS3 the mask is dynamic.
+        static const bool mask_unexported = [] {
+            const char* const value = std::getenv("EDEN_C0_FRAG_EXPORT_MASK");
+            return value == nullptr || value[0] != '0';
+        }();
+        const bool exported = !mask_unexported || key.state.extended_dynamic_state_3_blend != 0 ||
+                              stage_infos[NUM_STAGES - 1].stores_frag_color[index];
         VkColorComponentFlags write_mask{};
         for (size_t i = 0; i < mask_table.size(); ++i) {
-            write_mask |= mask[i] ? mask_table[i] : 0;
+            write_mask |= exported && mask[i] ? mask_table[i] : 0;
         }
         cb_attachments.push_back({
             .blendEnable = blend.enable != 0,
