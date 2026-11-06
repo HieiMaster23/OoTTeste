@@ -253,6 +253,29 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
         return true;
     }
+    // Ports of the latched resume in #231 and the GEQUAL precheck in #166.
+    static const bool fast_resume = [] {
+        const char* value = std::getenv("EDEN_C0_ACQUIRE_RESUME");
+        return value != nullptr && value[0] == '1';
+    }();
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (fast_resume && split.Active()) {
+        if (Nx2SemaphoreWaiters::Get().Latched(this)) {
+            return true;
+        }
+        if (static_cast<GpuSemaphoreOperation>(pending_acquire->operation) ==
+            GpuSemaphoreOperation::AcquireGequal) {
+            const auto device =
+                dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address);
+            if (device && !Nx2IsGpuWritten(*device) &&
+                pending_acquire->Matches(
+                    dma_pusher.memory_manager.Read<u32>(pending_acquire->address))) {
+                // Later GPU-written command lists must still observe the queued host sync.
+                split.NoteSync();
+                return true;
+            }
+        }
+    }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
     DrainBack();
