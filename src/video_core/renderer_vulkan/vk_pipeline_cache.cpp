@@ -395,6 +395,13 @@ size_t GetTotalPipelineWorkers() {
     }
     return std::min(max_core_threads, desired);
 #else
+    // EDEN_C0_PIPELINE_WORKERS=<n> caps them, to weigh compile time against CPU contention.
+    if (const char* const value = std::getenv("EDEN_C0_PIPELINE_WORKERS")) {
+        const size_t configured = std::strtoul(value, nullptr, 10);
+        if (configured != 0) {
+            return std::min(max_core_threads, configured);
+        }
+    }
     return max_core_threads;
 #endif
 }
@@ -432,8 +439,10 @@ namespace {
 bool DriverCachesPipelines(const Device& device) {
     switch (device.GetDriverID()) {
     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
-    case VK_DRIVER_ID_AMD_PROPRIETARY:
         return true;
+    case VK_DRIVER_ID_AMD_PROPRIETARY:
+        // EDEN_C0_AMD_PIPELINE_CACHE=1 keeps an explicit VkPipelineCache on this driver too.
+        return std::getenv("EDEN_C0_AMD_PIPELINE_CACHE") == nullptr;
     default:
         return false;
     }
@@ -1176,8 +1185,13 @@ void PipelineCache::EvictUnusedPipelines() {
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
     // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
-    constexpr u64 EvictAfterFrames = 9000;
-    if (frame_count <= EvictAfterFrames) {
+    // EDEN_C0_PIPELINE_EVICT_FRAMES=<frames> changes that, 0 never evicts: at 20 fps 9000 frames
+    // are only 7.5 minutes, and AMD's driver can take far longer than that to build one again.
+    static const u64 EvictAfterFrames = [] {
+        const char* const value = std::getenv("EDEN_C0_PIPELINE_EVICT_FRAMES");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : u64{9000};
+    }();
+    if (EvictAfterFrames == 0 || frame_count <= EvictAfterFrames) {
         return;
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
