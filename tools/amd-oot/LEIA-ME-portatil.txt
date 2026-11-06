@@ -1,0 +1,40 @@
+Lichii AMD para Ocarina of Time (build experimental, {{LABEL}}, {{TARGET}})
+=========================================================================
+
+NÃO PRECISA INSTALAR NADA: extraia a pasta inteira e execute lichii.exe.
+O runtime do Visual C++ e tudo o que o emulador usa já estão nesta pasta.
+Não execute o programa de dentro do zip nem separe os arquivos.
+
+O QUE NÃO VEM JUNTO
+- Keys, firmware e o jogo. São dumps do seu próprio console e não podem ser distribuídos.
+  Sem eles o emulador abre, mas não roda o jogo.
+
+O QUE O PC PRECISA TER
+- Windows 10 ou 11, 64 bits.
+- {{CPU}}
+- GPU com suporte a Vulkan e driver de vídeo atualizado. Testada com 8 GB de VRAM.
+  Em caso de erro de Vulkan ao abrir, atualize o driver da placa de vídeo.
+
+COMO JOGAR
+1. Execute lichii.exe.
+2. Coloque suas keys em user\keys e instale o firmware pelo menu do emulador.
+3. Abra o jogo pelo menu File.
+4. A primeira sessão vai travar enquanto compila os shaders, às vezes por mais de um minuto.
+
+JÁ VEM CONFIGURADO
+- user\config\qt-config.ini: modo Docked, precisão de GPU Low, shaders assíncronos.
+- nx2_switches.txt:
+  EDEN_NX2_REJECT_HASH=c72b6ea746c00433 desliga um layer que hoje desenha manchas sobre a cena.
+  A névoa rente ao chão e a superfície do rio ficam faltando.
+  EDEN_NX2_TC_MIN_AGE=600, EDEN_NX2_RESUME_ADD=0, EDEN_C0_SUBMIT_BEFORE_FENCE_WAIT=1.
+
+AVISOS
+- Testada só em uma AMD RX 6600M, driver 2.0.353. Em outras placas pode travar ou mostrar a imagem errada.
+- Build experimental. Faça backup dos seus saves.
+
+CÓDIGO-FONTE E LICENÇA (GPL-3.0-or-later)
+- Código desta build: https://github.com/HieiMaster23/OoTTeste, commit {{COMMIT}}.
+- Base: zortos293/Lichii, commit 5f6066b26, com sharkiix (Shakoquo/Lichii-sharkiix-version, commit 28f594acc).
+- Licença em LICENSE.txt. O Qt 6.8.3 é usado sob LGPL-3.0 (LICENSE-Qt-LGPL-3.0.txt).
+- Inclui o runtime do Visual C++ da Microsoft, redistribuído como previsto pela Microsoft.
+- Este pacote não é oficial e não tem ligação com a Nintendo nem com os autores do Lichii.

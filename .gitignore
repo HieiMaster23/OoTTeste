@@ -6,6 +6,7 @@
 
 # Build directory
 /[Bb]uild*/
+/tools/amd-oot/local-paths.cmd
 doc-build/
 out/
 AppDir/

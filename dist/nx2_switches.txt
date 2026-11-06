@@ -36,3 +36,15 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_SPLIT_SKIP=1
 #EDEN_NX2_AUTO_STUB=1
 #EDEN_NX2_KEEP_ASTC=1
+
+# --- Ocarina of Time (sharkiix's version) ---
+# Texture cleanup keeps images used in the last 600 frames (avoids flashes).
+EDEN_NX2_TC_MIN_AGE=600
+# Ground mist shader removed for now (renders as a white veil over the whole screen).
+EDEN_NX2_REJECT_HASH=c72b6ea746c00433
+# Speculative resume shortcut off (caused flicker).
+EDEN_NX2_RESUME_ADD=0
+
+# --- AMD ---
+# Submits pending work before waiting on a fence.
+EDEN_C0_SUBMIT_BEFORE_FENCE_WAIT=1

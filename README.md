@@ -6,6 +6,8 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
+> **OoTTeste** é uma cópia experimental do Lichii para rodar *The Legend of Zelda: Ocarina of Time* de Switch 2 em GPUs AMD. Foi modificada em novembro de 2026 a partir de [zortos293/Lichii](https://github.com/zortos293/Lichii), commit `5f6066b26`, e não é um projeto oficial. O estado atual e como compilar estão em [docs/amd-oot](docs/amd-oot/README.md), e as builds, em [Releases](https://github.com/HieiMaster23/OoTTeste/releases). Keys, firmware e jogos não estão incluídos.
+
 <p align="center">
   <img src="dist/branding/lichii_icon_with_logo.png" alt="Lichii" width="600">
 </p>
