@@ -1110,16 +1110,30 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         };
         const auto& blend{key.state.attachments[index]};
         const std::array mask{blend.Mask()};
-        // A target the fragment shader doesn't export to is undefined in Vulkan while its writes
-        // are enabled. Ocarina of Time has a depth-only mask draw (fragment 4f5673eca06ebecb) with
-        // color writes on; AMD's driver leaves a black line along its surviving pixels.
-        // EDEN_C0_FRAG_EXPORT_MASK=0 keeps the guest's mask. With EDS3 the mask is dynamic.
-        static const bool mask_unexported = [] {
+        // A fragment shader that exports no color at all leaves its targets undefined in Vulkan
+        // while their writes are enabled. Ocarina of Time has a depth-only mask draw (fragment
+        // 4f5673eca06ebecb) with color writes on; AMD's driver leaves a black line along its
+        // surviving pixels. Masking every unexported target instead (=2) turns Link black in parts
+        // of Hyrule Field, so a draw exporting only some targets keeps writing the others. =0
+        // keeps the guest's mask. With EDS3 the mask is dynamic.
+        static const int mask_unexported = [] {
             const char* const value = std::getenv("EDEN_C0_FRAG_EXPORT_MASK");
-            return value == nullptr || value[0] != '0';
+            return value != nullptr ? std::atoi(value) : 1;
         }();
-        const bool exported = !mask_unexported || key.state.extended_dynamic_state_3_blend != 0 ||
-                              stage_infos[NUM_STAGES - 1].stores_frag_color[index];
+        const auto& exports = stage_infos[NUM_STAGES - 1].stores_frag_color;
+        const bool exports_any = std::ranges::any_of(exports, [](bool value) { return value; });
+        const bool masked = key.state.extended_dynamic_state_3_blend == 0 &&
+                            (mask_unexported == 1 ? !exports_any
+                                                  : mask_unexported == 2 && !exports[index]);
+        const bool exported = !masked;
+        if (!exports[index] && exports_any) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+                LOG_INFO(Render_Vulkan,
+                         "Fragment {:016x} exports other targets but not {} (blend {}, masked {})",
+                         key.unique_hashes[NUM_STAGES], index, blend.enable != 0, masked);
+            }
+        }
         VkColorComponentFlags write_mask{};
         for (size_t i = 0; i < mask_table.size(); ++i) {
             write_mask |= exported && mask[i] ? mask_table[i] : 0;

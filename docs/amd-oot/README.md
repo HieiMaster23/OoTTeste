@@ -17,7 +17,7 @@ Medido em uma RX 6600M, driver 2.0.353, sem `VK_EXT_robustness2`, em Kokiri e no
 |---|---|
 | Tela escura, vegetação, exposição e neblina volumétrica | Corrigidos na base anterior. **A imagem nesta base nova ainda não foi conferida** |
 | Queda do driver ao compilar shaders | Contornada: a falha do compilador é capturada e o pipeline é refeito sem subgroup. Os dois fragments conhecidos agora compilam sem otimização |
-| Linha preta no horizonte em Hyrule Field | Correção candidata nesta versão, **ainda não testada** |
+| Linha preta no horizonte em Hyrule Field | Causada por um draw de máscara que não exporta cor. Corrigida na RX 6600M. A primeira versão da correção deixava Link preto em partes de Hyrule Field; a atual só atua em shaders sem nenhuma exportação |
 | Estabilidade | Cerca de 8 min nesta base, sem perda de dispositivo |
 | Manchas do layer `c72b6ea746c00433` | Contornadas ao desligar o shader, o que também remove a névoa rente ao chão e o rio |
 | FPS | Antes desta versão: 21-24 em Kokiri nas melhores janelas e 19-20 em Hyrule Field. **Esta versão ainda não foi medida** |
@@ -34,7 +34,7 @@ Base: [zortos293/Lichii](https://github.com/zortos293/Lichii), commit `5f6066b26
 - Captura de falha do compilador AMD e nova tentativa sem subgroup. O fallback é traduzido na thread da GPU e emitido no worker.
 - Proteções para AMD: `EDEN_C0_AMD_BOUNDS`, buffer nulo, `EDEN_C0_AMD_DISPATCH_BARRIERS` e `EDEN_C0_PTR_*`.
 - Do Lichii: #185 (ordem de deferred clear), #176 (banco uniforme), #192 (pipelines guardados e de mesh no disco), os commits da build-88 (#193, #194 e #240) e os PRs #206 (laço atômico) e #210 (compilação sem otimização). Do #240 vem o Dynamic FPS, ligado por padrão. Quem já tem o mod `Dynamic-fps` continua usando o próprio.
-- `EDEN_C0_FRAG_EXPORT_MASK`: não escreve em alvos de cor que o fragment não exporta. Só no caminho de máscara estática; drivers com blend dinâmico (EDS3) não mudam.
+- `EDEN_C0_FRAG_EXPORT_MASK`: `1` (padrão) não escreve cor com fragments que não exportam nenhuma; `2` bloqueia todo alvo não exportado, o que deixa Link preto; `0` desliga. Só no caminho de máscara estática; drivers com blend dinâmico (EDS3) não mudam.
 - `EDEN_C0_SUBMIT_BEFORE_FENCE_WAIT`: envia o trabalho pendente antes de esperar uma fence.
 - `EDEN_NX2_WRITTEN_SSBO_MARK_KIB`, desligado por padrão, e `EDEN_NX2_PRESENT_STATS_EVERY` funcionando.
 
