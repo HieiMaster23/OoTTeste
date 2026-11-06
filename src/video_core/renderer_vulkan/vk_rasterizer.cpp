@@ -1980,7 +1980,11 @@ void RasterizerVulkan::TracePendingCpuWrites(bool compute, std::span<const u64> 
 }
 
 bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {
-    static constexpr u32 BUFFER_CAP = 4U << 20;
+    static const u32 BUFFER_CAP = [] {
+        const char* value = std::getenv("EDEN_C0_FRAME_BUFFER_CAP_MIB");
+        const u32 mib = value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 4;
+        return std::clamp(mib, 1U, 64U) << 20;
+    }();
     std::vector<FrameDump::BoundBuffer> buffers;
     buffer_cache.ForEachBoundBuffer(compute, [&](u32 stage, bool storage, u32 index, bool written,
                                                  const auto& binding, u32 bound_size,
