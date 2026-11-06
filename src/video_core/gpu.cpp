@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <list>
 #include <memory>
 #include <utility>
@@ -238,13 +239,33 @@ struct GPU::Impl {
                      raster_area.start_address, raster_area.end_address,
                      reads.load(std::memory_order_relaxed));
         }
-        const u64 fence = RequestSyncOperation([this, raster_area]() {
+        static const bool profile_reads = [] {
+            const char* value = std::getenv("EDEN_C0_CPU_READ_PROFILE");
+            return value != nullptr && value[0] == '1';
+        }();
+        using Clock = std::chrono::steady_clock;
+        const auto started = profile_reads ? Clock::now() : Clock::time_point{};
+        std::atomic<u64> service_ns{};
+        const u64 fence = RequestSyncOperation([this, raster_area, &service_ns]() {
+            const auto begin = profile_reads ? Clock::now() : Clock::time_point{};
             // Apply collected guest writes before downloading GPU data over guest memory.
             InvalidateGPUCache();
             renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
+            if (profile_reads) {
+                service_ns.store(static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin)
+                        .count()), std::memory_order_relaxed);
+            }
         });
         gpu_thread.TickGPU(is_async);
         WaitForSyncOperation(fence);
+        if (profile_reads) {
+            const double total_ms = std::chrono::duration<double, std::milli>(
+                                        Clock::now() - started).count();
+            LOG_INFO(HW_GPU, "C0 CPU read [{:#x}, {:#x}): total {:.3f} ms, service {:.3f} ms",
+                     raster_area.start_address, raster_area.end_address, total_ms,
+                     static_cast<double>(service_ns.load(std::memory_order_relaxed)) / 1e6);
+        }
         return raster_area;
     }
 
