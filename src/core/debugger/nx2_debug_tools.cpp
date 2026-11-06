@@ -302,6 +302,46 @@ json CaptureFrame(ToolState& state, const json& params) {
     if (!IsVulkan()) {
         throw std::runtime_error{"frame capture needs the Vulkan renderer"};
     }
+    std::shared_ptr<const std::vector<InputStep>> script;
+    HID::EmulatedController* controller = nullptr;
+    u64 first_present = 0;
+    u64 target_present = 0;
+    if (params.contains("input_steps")) {
+        const auto& list = params.at("input_steps");
+        if (!list.is_array() || list.empty() || list.size() > MAX_INPUT_STEPS) {
+            throw std::runtime_error{"input_steps must contain 1 to 1000 steps"};
+        }
+        std::vector<InputStep> steps;
+        u64 total = 0;
+        for (const auto& step : list) {
+            steps.push_back(ParseInputStep(step));
+            total += steps.back().frames;
+        }
+        if (total > MAX_INPUT_FRAMES) {
+            throw std::runtime_error{"input_steps exceeds 36000 frames"};
+        }
+        const u64 offset = Param<u64>(params, "capture_after", 0, 0, total - 1);
+        auto& hid = state.system.HIDCore();
+        controller = hid.GetEmulatedController(HID::NpadIdType::Player1);
+        if (!controller->IsConnected()) {
+            controller = hid.GetEmulatedController(HID::NpadIdType::Handheld);
+        }
+        if (!controller->IsConnected()) {
+            throw std::runtime_error{"no controller is connected"};
+        }
+        script = std::make_shared<const std::vector<InputStep>>(std::move(steps));
+        first_present = g_nx2_present_count.load(std::memory_order_relaxed) + 1;
+        target_present = first_present + offset;
+        controller->SetInputInjector([script, first_present] {
+            return InputAt(*script, first_present,
+                           g_nx2_present_count.load(std::memory_order_relaxed));
+        });
+    }
+    SCOPE_EXIT {
+        if (controller) {
+            controller->SetInputInjector({});
+        }
+    };
     const u64 id = ++state.captures;
     const auto directory = state.dump_directory / fmt::format("capture-{}-{:03}", state.session, id);
     std::filesystem::create_directories(directory);
@@ -309,7 +349,8 @@ json CaptureFrame(ToolState& state, const json& params) {
     const bool buffers = params.value("buffers", false);
     const int timeout = Param<int>(params, "timeout_s", 120, 1, 600);
     VideoCore::Nx2Debug::RequestCapture(
-        {.id = id, .directory = directory, .sampled = sampled, .buffers = buffers});
+        {.id = id, .directory = directory, .sampled = sampled, .buffers = buffers,
+         .not_before_present = target_present});
     const auto finished = VideoCore::Nx2Debug::WaitCapture(id, std::chrono::seconds{timeout});
     if (!finished) {
         VideoCore::Nx2Debug::CancelCapture(id);
@@ -347,6 +388,8 @@ json CaptureFrame(ToolState& state, const json& params) {
     }
     return {
         {"directory", directory.generic_string()},
+        {"first_input_present", first_present},
+        {"capture_not_before_present", target_present},
         {"sampled", sampled},
         {"buffers", buffers},
         {"frame", std::move(frame)},

@@ -24,6 +24,7 @@ struct CaptureRequest {
     bool sampled;
     /// The uniform and storage buffers of every draw and dispatch, and dispatch group counts.
     bool buffers;
+    u64 not_before_present{};
 };
 
 struct CaptureResult {
@@ -64,7 +65,7 @@ void CancelCapture(u64 id);
 /// session ends.
 [[nodiscard]] std::optional<CaptureResult> WaitCapture(u64 id, std::chrono::milliseconds timeout);
 /// Rasterizer thread.
-[[nodiscard]] std::optional<CaptureRequest> TakeCapture();
+[[nodiscard]] std::optional<CaptureRequest> TakeCapture(u64 present = 0);
 /// Frame dump writer thread, once the manifest summary is written (or the capture failed).
 void FinishCapture(u64 id, CaptureResult result);
 

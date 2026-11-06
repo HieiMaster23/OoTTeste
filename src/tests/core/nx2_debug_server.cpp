@@ -194,6 +194,20 @@ TEST_CASE("Debug control hands captures to the rasterizer once", "[core][nx2_deb
     REQUIRE(std::chrono::steady_clock::now() - begin < 10s);
 }
 
+TEST_CASE("Debug control waits for a scheduled present", "[core][nx2_debug_server]") {
+    VideoCore::Nx2Debug::BeginSession();
+    VideoCore::Nx2Debug::RequestCapture({.id = 8, .directory = "dir", .sampled = false,
+                                       .buffers = false, .not_before_present = 100});
+    REQUIRE_FALSE(VideoCore::Nx2Debug::TakeCapture(99));
+    REQUIRE(VideoCore::Nx2Debug::HasRequests());
+    const auto request = VideoCore::Nx2Debug::TakeCapture(100);
+    REQUIRE(request);
+    REQUIRE(request->id == 8);
+    REQUIRE_FALSE(VideoCore::Nx2Debug::TakeCapture(101));
+    REQUIRE_FALSE(VideoCore::Nx2Debug::HasRequests());
+    VideoCore::Nx2Debug::EndSession();
+}
+
 TEST_CASE("Debug control counts reject generations", "[core][nx2_debug_server]") {
     VideoCore::Nx2Debug::BeginSession();
     REQUIRE_FALSE(VideoCore::Nx2Debug::AnyRejected());

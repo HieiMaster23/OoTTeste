@@ -31,6 +31,7 @@
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "core/core.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
@@ -2023,7 +2024,10 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 
 void RasterizerVulkan::TickFrame() {
     if (VideoCore::Nx2Debug::HasRequests()) {
-        if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
+        const u64 present = Core::g_nx2_present_count.load(std::memory_order_relaxed);
+        if (auto capture = VideoCore::Nx2Debug::TakeCapture(present)) {
+            LOG_INFO(Render_Vulkan, "Scheduled capture id={} target_present={} observed_present={}",
+                     capture->id, capture->not_before_present, present);
             frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
                            capture->id);
         }

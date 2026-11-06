@@ -93,9 +93,9 @@ std::optional<CaptureResult> WaitCapture(u64 id, std::chrono::milliseconds timeo
     return result;
 }
 
-std::optional<CaptureRequest> TakeCapture() {
+std::optional<CaptureRequest> TakeCapture(u64 present) {
     std::scoped_lock lock{state.mutex};
-    if (state.captures.empty()) {
+    if (state.captures.empty() || state.captures.front().not_before_present > present) {
         return std::nullopt;
     }
     CaptureRequest request = std::move(state.captures.front());
