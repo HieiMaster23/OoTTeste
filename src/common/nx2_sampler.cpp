@@ -121,15 +121,20 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
 
 // Walks a suspended thread's stack from its context. Nothing here may allocate: the thread
 // could be paused holding the heap lock.
-unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
+unsigned WalkImpl(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
     unsigned depth = 0;
     while (depth < MaxDepth && context.Rip != 0) {
         frames[depth++] = context.Rip;
+        // Stop at JIT code: its unwind table does not describe every generated call frame.
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(context.Rip), &memory, sizeof(memory)) == 0 ||
+            memory.Type != MEM_IMAGE) {
+            break;
+        }
         DWORD64 image_base{};
         const PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
         if (function == nullptr) {
-            // A leaf function (no unwind data): its return address is on top of the stack. JIT
-            // code has none either; past the first frame, stop there.
+            // Only follow a leaf return address at the first frame.
             if (depth != 1) {
                 break;
             }
@@ -143,6 +148,20 @@ unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
                          &handler_data, &establisher_frame, nullptr);
     }
     return depth;
+}
+
+unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
+#ifdef _MSC_VER
+    __try {
+        return WalkImpl(context, frames);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                               : EXCEPTION_CONTINUE_SEARCH) {
+        // Discard an invalid stack and let the caller resume the target thread.
+        return 0;
+    }
+#else
+    return WalkImpl(context, frames);
+#endif
 }
 
 struct Symbolizer {
